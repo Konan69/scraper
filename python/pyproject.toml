@@ -1,0 +1,25 @@
+[project]
+name = "scraper"
+version = "0.1.0"
+description = ""
+authors = [{ name = "Konan", email = "kixeyems0@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.9,<3.12"
+dependencies = [
+    "crawl4ai (==0.4.3b1)",
+    "python-dotenv>=1.0.1,<2.0.0",
+    "langchain>=0.1.0",
+    "langchain-openai>=0.0.2",
+    "langchain-community>=0.0.10",
+    "pinecone-client>=3.0.0",
+    "cohere>=4.37",
+    "langchain-pinecone (>=0.2.2,<0.3.0)",
+    "langchain-cohere (>=0.4.2,<0.5.0)",
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+scraper = "scraper.__init__:run"
