@@ -18,7 +18,7 @@ from langchain.chains.retrieval import create_retrieval_chain
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.chains.combine_documents import create_stuff_documents_chain
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlResult, CrawlerRunConfig, CacheMode
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 from langchain.chains.history_aware_retriever import create_history_aware_retriever
 from pydantic import SecretStr
 # Load environment variables from .env file
@@ -79,7 +79,7 @@ async def cleanup_pinecone():
         logger.error(f"Error during Pinecone cleanup: {str(e)}")
         raise
 
-async def crawl_and_process(url: str, max_depth: int = 4, max_pages: int =21) -> List[Document]:
+async def crawl_and_process(url: str, max_depth: int = 3, max_pages: int =21) -> List[Document]:
     """Strict depth-first crawling with full error handling"""
     try:
         parsed_url = urlparse(url)
@@ -142,9 +142,13 @@ async def crawl_and_process(url: str, max_depth: int = 4, max_pages: int =21) ->
                         continue
 
                     # Add document if successful
-                    if result.markdown:
+                    if result.markdown or result.html:
+                        content = result.markdown if result.markdown else result.html
+                        # Convert HTML to text if necessary (optional)
+                        from html import unescape
+                        content = unescape(content)  # Basic HTML entity decoding
                         documents.append(Document(
-                            page_content=result.markdown,
+                            page_content=content,
                             metadata={
                                 "source": result.url,
                                 "depth": current_depth,
@@ -160,8 +164,7 @@ async def crawl_and_process(url: str, max_depth: int = 4, max_pages: int =21) ->
                             depth_map,
                             base_url,
                             domain,
-                            visited,
-                            max_pages
+                            visited
                         )
 
                 current_depth += 1
@@ -177,14 +180,12 @@ async def crawl_and_process(url: str, max_depth: int = 4, max_pages: int =21) ->
 
 
 async def process_links(html: str, next_depth: int, depth_map: defaultdict, 
-                        base_url: str, domain: str, visited: set, max_pages: int):
+                        base_url: str, domain: str, visited: set):
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, 'lxml')
     links = []
     
     for a in soup.find_all('a', href=True):
-        if len(visited) >= max_pages:
-            break
         raw_link = a['href']
         normalized = normalize_url(raw_link, base_url, domain)
         if normalized and normalized not in visited:
@@ -192,7 +193,7 @@ async def process_links(html: str, next_depth: int, depth_map: defaultdict,
             links.append(normalized)
             logger.debug(f"Found new link: {normalized}")
     
-    if links and len(visited) < max_pages:
+    if links:
         depth_map[next_depth].extend(links)
 
 async def handle_retry(url: str, depth_map: defaultdict, current_depth: int, 
@@ -217,20 +218,14 @@ async def extract_and_filter_links(html: str, base_url: str, domain: str, visite
     links = []
     
     for a in soup.find_all('a', href=True):
-        if len(visited) >= max_pages:
-            break
-            
         raw_link = a['href']
         normalized = normalize_url(raw_link, base_url, domain)
         
         if normalized and normalized not in visited:
             visited.add(normalized)
             links.append(normalized)
-            
-            if len(visited) >= max_pages:
-                break
-    
     return links
+
 def normalize_url(link: str, base_url: str, domain: str) -> Optional[str]:
     parsed = urlparse(link)
     if not parsed.netloc:
