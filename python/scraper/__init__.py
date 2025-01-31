@@ -1,7 +1,10 @@
+from collections import defaultdict, deque
+import datetime
 import os
 import asyncio
 import logging
-from typing import List 
+from typing import List, Optional
+from urllib.parse import urljoin, urlparse 
 from pinecone import Pinecone
 from dotenv import load_dotenv
 from langchain_core.documents import Document
@@ -22,7 +25,7 @@ from pydantic import SecretStr
 load_dotenv()
 
 # Configure logging
-# logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scraper")
 
 # Environment variables
@@ -76,104 +79,178 @@ async def cleanup_pinecone():
         logger.error(f"Error during Pinecone cleanup: {str(e)}")
         raise
 
-async def crawl_and_process(url: str, max_depth: int = 3, max_pages: int = 30) -> List[Document]:
-    """
-    Crawl website recursively and return list of LangChain Documents using parallel processing
-    Args:
-        url: Starting URL to crawl
-        max_depth: Maximum depth for recursive crawling (default: 3)
-        max_pages: Maximum number of pages to crawl (default: 30)
-    """
+async def crawl_and_process(url: str, max_depth: int = 4, max_pages: int =21) -> List[Document]:
+    """Strict depth-first crawling with full error handling"""
     try:
+        parsed_url = urlparse(url)
+        domain = parsed_url.netloc
+        base_url = f"{parsed_url.scheme}://{domain}"
+        
         browser_conf = BrowserConfig(
             headless=True,
             java_script_enabled=True,
             verbose=False,
-            extra_args=["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox"]
-        )
         
+            extra_args=["--disable-gpu", "--no-sandbox"]
+        )
+
         run_conf = CrawlerRunConfig(
             cache_mode=CacheMode.BYPASS,
             wait_for_images=False,
-            stream=False
+            stream=True
         )
 
-        # Initialize memory-adaptive dispatcher for efficient parallel crawling
         dispatcher = MemoryAdaptiveDispatcher(
-            memory_threshold_percent=70.0,  # Pause if memory exceeds 70%
-            check_interval=1.0,
-            max_session_permit=10  # Maximum concurrent tasks
+            memory_threshold_percent=70.0,
+            max_session_permit=50
         )
 
         documents = []
-        visited_urls = set([url])
-        urls_to_crawl = [url]
-        
+        visited = set()
+        depth_map = defaultdict(list)
+        current_depth = 0
+
+        # Initialize with normalized start URL
+        start_url = normalize_url(url, base_url, domain)
+        if not start_url:
+            raise ValueError("Invalid starting URL")
+            
+        depth_map[0].append(start_url)
+        visited.add(start_url)
+
         async with AsyncWebCrawler(config=browser_conf) as crawler:
-            while urls_to_crawl and len(visited_urls) < max_pages:
-                # Take next batch of URLs to process
-                current_batch = urls_to_crawl[:max_pages - len(visited_urls)]
-                urls_to_crawl = []  # Clear the list as we'll add new URLs from results
-                
-                # Process batch using arun_many without streaming
+            while current_depth <= max_depth and len(documents) < max_pages:
+                # Get all URLs for current depth
+                current_urls = depth_map[current_depth]
+                if not current_urls:
+                    current_depth += 1
+                    continue
+
+                # Process all URLs at this depth in one arun_many call
+                logger.info(f"Processing depth {current_depth} with {len(current_urls)} URLs")
                 results = await crawler.arun_many(
-                    urls=current_batch,
+                    urls=current_urls,
                     config=run_conf,
                     dispatcher=dispatcher
                 )
-                
-                # Process results - results is a List[CrawlResult] when not streaming
-                for result in results:  # type: ignore
+
+                # Process results with retries
+                async for result in results: # type: ignore
                     if not result.success:
-                        logger.warning(f"Failed to crawl {result.url}: {result.error_message}")
+                        logger.error(f"Failed to crawl {result.url}: {result.error_message}")
+                        await handle_retry(result.url, depth_map, current_depth, max_depth, visited)
                         continue
 
-                    if result.markdown and isinstance(result.markdown, str):
-                        # Create document from the crawled content
-                        documents.append(
-                            Document(
-                                page_content=result.markdown,
-                                metadata={"source": result.url}
-                            )
+                    # Add document if successful
+                    if result.markdown:
+                        documents.append(Document(
+                            page_content=result.markdown,
+                            metadata={
+                                "source": result.url,
+                                "depth": current_depth,
+                                "crawled_at": datetime.datetime.now().isoformat()
+                            }
+                        ))
+
+                    # Process links for next depth
+                    if current_depth < max_depth and result.html:
+                        await process_links(
+                            result.html, 
+                            current_depth + 1,
+                            depth_map,
+                            base_url,
+                            domain,
+                            visited,
+                            max_pages
                         )
-                        
-                        # Extract new links if we haven't reached max depth
-                        current_depth = len(result.url.split('/')) - len(url.split('/'))
-                        if current_depth < max_depth and result.html and isinstance(result.html, str):
-                            from bs4 import BeautifulSoup
-                            soup = BeautifulSoup(result.html, 'html.parser')
-                            new_links = [
-                                a.get('href') for a in soup.find_all('a', href=True)
-                                if a.get('href').startswith('http')
-                            ]
-                            
-                            # Filter for same domain and unvisited links
-                            same_domain_links = [
-                                link for link in new_links
-                                if is_same_domain(link, url) and link not in visited_urls
-                            ]
-                            
-                            # Add new links to process
-                            visited_urls.update(same_domain_links)
-                            urls_to_crawl.extend(same_domain_links)
-                            
-                            if same_domain_links:
-                                logger.info(f"Found {len(same_domain_links)} new links at depth {current_depth}")
-            
-            logger.info(f"Created {len(documents)} documents from {len(visited_urls)} crawled pages")
-            return documents
-            
+
+                current_depth += 1
+        logger.info(f"Crawled {len(documents)} documents from {len(visited)} pages")
+
+        logger.info(f"visited: {visited}")
+
+        return documents
+
     except Exception as e:
-        logger.error(f"Error during crawling: {str(e)}")
+        logger.error(f"Crawling failed: {str(e)}")
         raise
 
-def extract_links_from_markdown(markdown: str) -> List[str]:
-    """Extract links from markdown content"""
-    # Simple regex to find markdown links
-    import re
-    links = re.findall(r'\[([^\]]+)\]\(([^)]+)\)', markdown)
-    return [link[1] for link in links]
 
+async def process_links(html: str, next_depth: int, depth_map: defaultdict, 
+                        base_url: str, domain: str, visited: set, max_pages: int):
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, 'lxml')
+    links = []
+    
+    for a in soup.find_all('a', href=True):
+        if len(visited) >= max_pages:
+            break
+        raw_link = a['href']
+        normalized = normalize_url(raw_link, base_url, domain)
+        if normalized and normalized not in visited:
+            visited.add(normalized)
+            links.append(normalized)
+            logger.debug(f"Found new link: {normalized}")
+    
+    if links and len(visited) < max_pages:
+        depth_map[next_depth].extend(links)
+
+async def handle_retry(url: str, depth_map: defaultdict, current_depth: int, 
+                      max_depth: int, visited: set, max_retries: int = 3):
+    for attempt in range(1, max_retries + 1):
+        logger.warning(f"Retry {attempt}/{max_retries} for {url}")
+        try:
+            async with AsyncWebCrawler() as crawler:
+                result = await crawler.arun(url)
+                if result.success:
+                    logger.info(f"Retry succeeded for {url}")
+                    return
+        except Exception as e:
+            logger.error(f"Retry {attempt} failed: {str(e)}")
+    
+    logger.error(f"Permanent failure for {url}")
+    # Do not remove from visited to prevent reprocessing
+async def extract_and_filter_links(html: str, base_url: str, domain: str, visited: set, max_pages: int) -> List[str]:
+    """Fast link extraction with domain filtering and URL normalization"""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, 'lxml')
+    links = []
+    
+    for a in soup.find_all('a', href=True):
+        if len(visited) >= max_pages:
+            break
+            
+        raw_link = a['href']
+        normalized = normalize_url(raw_link, base_url, domain)
+        
+        if normalized and normalized not in visited:
+            visited.add(normalized)
+            links.append(normalized)
+            
+            if len(visited) >= max_pages:
+                break
+    
+    return links
+def normalize_url(link: str, base_url: str, domain: str) -> Optional[str]:
+    parsed = urlparse(link)
+    if not parsed.netloc:
+        link = urljoin(base_url, link)
+        parsed = urlparse(link)
+    
+    # Allow subdomains by checking if the domain is a suffix
+    if not parsed.netloc.endswith(domain):
+        return None
+    if parsed.scheme not in ('http', 'https'):
+        return None
+    
+    path = parsed.path.rstrip('/') or '/'
+    return parsed._replace(
+        scheme=parsed.scheme.lower(),
+        netloc=parsed.netloc.lower(),
+        path=path,
+        query=parsed.query.strip(),
+        fragment=''
+    ).geturl()
 def is_same_domain(url1: str, url2: str) -> bool:
     """Check if two URLs are from the same domain"""
     from urllib.parse import urlparse
@@ -239,7 +316,6 @@ async def setup_rag_pipeline(docs):
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}")
         ])
-
         # Create retriever chain
         retriever = create_history_aware_retriever(
             llm=llm,
@@ -272,7 +348,6 @@ async def main():
         # Crawl the documentation
         logger.info("Starting document crawling...")
         documents = await crawl_and_process("https://docs.anthropic.com/en/docs/initial-setup")
-        
         # Split content
         splitter = RecursiveCharacterTextSplitter.from_language(
             language=Language.MARKDOWN,
@@ -302,21 +377,26 @@ async def main():
         chat_history = []
         while True:
             try:
-                question = input("Enter your question: ").strip()
+                question = await asyncio.to_thread(input) 
+                question = question.strip()  
                 
                 if question.lower() == 'exit':
                     logger.info("Cleaning up...")
                     pinecone.delete_index("scraper")
                     logger.info("Goodbye!")
                     break
+                full_answer = ""
                 
-                response = await chain.ainvoke({
+                async for chunk in chain.astream({
                     "chat_history": chat_history,
                     "input": question
-                })
+                }):
+                    if chunk.get('answer') is not None:
+                        print(chunk['answer'], end="", flush=True)    
+                        full_answer += chunk['answer']
                 
-                print(f"\nAnswer: {response['answer']}\n")
-                chat_history.extend([("human", question), ("assistant", response['answer'])])
+                print()
+                chat_history.extend([("human", question), ("assistant", full_answer)])
                 
             except KeyboardInterrupt:
                 logger.info("\nReceived interrupt signal. Cleaning up...")
@@ -326,9 +406,6 @@ async def main():
                 logger.error(f"Error processing question: {str(e)}")
                 print("An error occurred. Please try again.")
 
-    except Exception as e:
-        logger.error(f"Fatal error: {str(e)}")
-        raise
     finally:
         try:
             pinecone.delete_index("scraper")
@@ -348,3 +425,4 @@ if __name__ == "__main__":
     run()
 
 
+# how to get started  with anthropic api

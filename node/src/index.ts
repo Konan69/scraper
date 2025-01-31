@@ -1,7 +1,7 @@
 import { ChatOpenAI } from "@langchain/openai";
 import FirecrawlApp from "@mendable/firecrawl-js";
 import { PineconeStore } from "@langchain/pinecone";
-import type { Document } from "@langchain/core/documents";
+import type { Document, DocumentInterface } from "@langchain/core/documents";
 import { CohereEmbeddings } from "@langchain/cohere";
 import { Pinecone } from "@pinecone-database/pinecone";
 import { AIMessage, HumanMessage } from "@langchain/core/messages";
@@ -18,6 +18,7 @@ import * as readline from "readline";
 
 import "dotenv/config";
 import { stdout } from "process";
+import { RunnableSequence } from "@langchain/core/runnables";
 
 // Environment variables validation
 const requiredEnvVars = [
@@ -60,14 +61,12 @@ const loader = new FireCrawlLoader({
   mode: "crawl",
   params: {
     maxDepth: 3,
-    limit: 30,
+    limit: 20,
     scrapeOptions: {
       formats: ["markdown"],
     },
   },
 });
-
-const app = new FirecrawlApp({ apiKey: firecrawlApiKey });
 
 async function cleanupPineconeIndex(indexName: string) {
   try {
@@ -119,11 +118,13 @@ async function loadDocuments() {
     const docs = await loader.load();
     console.log(`Loaded ${docs.length} documents`);
 
+    const docTitles = docs.map((doc: DocumentInterface) => doc.metadata.title);
+    console.log(docTitles);
+
     const mdSplitter = RecursiveCharacterTextSplitter.fromLanguage("markdown", {
       chunkSize: 1000,
       chunkOverlap: 200,
     });
-    console.log(docs[0]);
     const mdDocs = await mdSplitter.splitDocuments(docs);
     console.log(`Split into ${mdDocs.length} chunks`);
     return mdDocs;
@@ -254,19 +255,23 @@ async function handleUserInput(
             chat_history: chatHistory,
             input,
           });
-
           let fullResponse = "";
-          await result.pipeTo(
-            new WritableStream({
-              write(chunk) {
-                const response = chunk.answer;
-                stdout.write(response);
+          const writableStream = new WritableStream({
+            write(chunk) {
+              if (chunk.answer !== undefined) {
+                const response = String(chunk.answer);
+                process.stdout.write(response);
                 fullResponse += response;
-              },
-            })
-          );
+              }
+            },
+            close() {
+              // Stream has ended
+            },
+          });
 
-          stdout.write("\n"); // Add newline after response
+          await result.pipeTo(writableStream);
+
+          stdout.write("\n");
           chatHistory.push(new HumanMessage(input));
           chatHistory.push(new AIMessage(fullResponse));
           resolve(false);
