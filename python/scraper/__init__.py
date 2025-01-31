@@ -79,7 +79,7 @@ async def cleanup_pinecone():
         logger.error(f"Error during Pinecone cleanup: {str(e)}")
         raise
 
-async def crawl_and_process(url: str, max_depth: int = 3, max_pages: int =21) -> List[Document]:
+async def crawl_and_process(url: str, max_depth: int = 3, max_pages: int = 12) -> List[Document]:
     """Strict depth-first crawling with full error handling"""
     try:
         parsed_url = urlparse(url)
@@ -90,7 +90,6 @@ async def crawl_and_process(url: str, max_depth: int = 3, max_pages: int =21) ->
             headless=True,
             java_script_enabled=True,
             verbose=False,
-        
             extra_args=["--disable-gpu", "--no-sandbox"]
         )
 
@@ -107,6 +106,7 @@ async def crawl_and_process(url: str, max_depth: int = 3, max_pages: int =21) ->
 
         documents = []
         visited = set()
+        urls_crawled = 0  # Track total URLs sent to arun_many
         depth_map = defaultdict(list)
         current_depth = 0
 
@@ -119,34 +119,41 @@ async def crawl_and_process(url: str, max_depth: int = 3, max_pages: int =21) ->
         visited.add(start_url)
 
         async with AsyncWebCrawler(config=browser_conf) as crawler:
-            while current_depth <= max_depth and len(documents) < max_pages:
-                # Get all URLs for current depth
+            while current_depth <= max_depth and urls_crawled < max_pages:
+                # Get URLs for current depth
                 current_urls = depth_map[current_depth]
                 if not current_urls:
                     current_depth += 1
                     continue
 
-                # Process all URLs at this depth in one arun_many call
-                logger.info(f"Processing depth {current_depth} with {len(current_urls)} URLs")
+                # Calculate remaining URLs we can crawl
+                remaining_urls = max_pages - urls_crawled
+                if remaining_urls <= 0:
+                    break
+
+                # Only take up to remaining_urls
+                batch_urls = current_urls[:remaining_urls]
+                urls_crawled += len(batch_urls)  # Update count before crawling
+                logger.info(f"Processing depth {current_depth} with {len(batch_urls)} URLs (total crawled: {urls_crawled}/{max_pages})")
+                
+                logger.info(f"batch_urls: {batch_urls}")
                 results = await crawler.arun_many(
-                    urls=current_urls,
+                    urls=batch_urls,
                     config=run_conf,
                     dispatcher=dispatcher
                 )
 
-                # Process results with retries
+                # Process results
                 async for result in results: # type: ignore
                     if not result.success:
                         logger.error(f"Failed to crawl {result.url}: {result.error_message}")
-                        await handle_retry(result.url, depth_map, current_depth, max_depth, visited)
                         continue
 
                     # Add document if successful
                     if result.markdown or result.html:
                         content = result.markdown if result.markdown else result.html
-                        # Convert HTML to text if necessary (optional)
                         from html import unescape
-                        content = unescape(content)  # Basic HTML entity decoding
+                        content = unescape(content)
                         documents.append(Document(
                             page_content=content,
                             metadata={
@@ -156,8 +163,8 @@ async def crawl_and_process(url: str, max_depth: int = 3, max_pages: int =21) ->
                             }
                         ))
 
-                    # Process links for next depth
-                    if current_depth < max_depth and result.html:
+                    # Only process links if we haven't reached max_pages for crawling
+                    if urls_crawled < max_pages and current_depth < max_depth and result.html:
                         await process_links(
                             result.html, 
                             current_depth + 1,
@@ -167,11 +174,12 @@ async def crawl_and_process(url: str, max_depth: int = 3, max_pages: int =21) ->
                             visited
                         )
 
-                current_depth += 1
-        logger.info(f"Crawled {len(documents)} documents from {len(visited)} pages")
+                # Remove processed URLs from current_urls
+                depth_map[current_depth] = current_urls[len(batch_urls):]
+                if not depth_map[current_depth]:
+                    current_depth += 1
 
-        logger.info(f"visited: {visited}")
-
+        logger.info(f"Finished crawling {urls_crawled} URLs, created {len(documents)} documents")
         return documents
 
     except Exception as e:
